@@ -1,6 +1,12 @@
 #!/usr/bin/env zsh
 
+generate_only=false
 agent="claude"
+
+if [[ "$1" == "--generate" ]]; then
+  generate_only=true
+  shift
+fi
 
 if [[ "$1" == "--agent" ]]; then
   case "$2" in
@@ -29,6 +35,11 @@ fi
 if [[ -z "$message" ]]; then
   echo "Failed to generate message. Aborting."
   exit 1
+fi
+
+if $generate_only; then
+  echo "$message"
+  exit 0
 fi
 
 printf '\nGenerated message:\n  %s\n\n' "$message"
