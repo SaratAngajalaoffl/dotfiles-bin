@@ -1,0 +1,55 @@
+#!/usr/bin/env zsh
+
+agent="claude"
+
+if [[ "$1" == "--agent" ]]; then
+  case "$2" in
+    claude|pi) agent="$2" ;;
+    *) echo "Unknown agent '$2'. Use 'claude' or 'pi'."; exit 1 ;;
+  esac
+fi
+
+if git diff --cached --quiet; then
+  echo "No staged changes to commit."
+  exit 1
+fi
+
+prompt="You are a commit message generator. Generate a single git commit message following the Conventional Commits specification. Format: <type>(<optional scope>): <description>. Common types: feat, fix, docs, style, refactor, test, chore, build, ci, perf. Rules: lowercase type, concise description, no period at end, one line only. Respond with the commit message only — no explanation, no markdown, no quotes.
+
+Staged diff:
+$(git diff --cached)"
+
+message=""
+if [[ "$agent" == "claude" ]]; then
+  message=$(claude -p "$prompt")
+else
+  message=$(pi -p --no-session "$prompt")
+fi
+
+if [[ -z "$message" ]]; then
+  echo "Failed to generate message. Aborting."
+  exit 1
+fi
+
+printf '\nGenerated message:\n  %s\n\n' "$message"
+echo -n "[y] commit  [e] edit  [n] abort: "
+read -r action
+
+case "$action" in
+  y|Y)
+    git commit -m "$message"
+    ;;
+  e|E)
+    tmp=$(mktemp /tmp/aic.XXXXXX)
+    printf '%s' "$message" > "$tmp"
+    "${EDITOR:-vim}" "$tmp"
+    edited=$(< "$tmp")
+    rm -f "$tmp"
+    [[ -z "$edited" ]] && { echo "Empty message. Aborting."; exit 1; }
+    git commit -m "$edited"
+    ;;
+  *)
+    echo "Aborted."
+    exit 1
+    ;;
+esac
