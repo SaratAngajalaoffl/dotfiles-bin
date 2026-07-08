@@ -1,0 +1,27 @@
+#!/usr/bin/env zsh
+
+state_file="$HOME/.local/state/lazygit/state.yml"
+
+root=$(git rev-parse --show-toplevel 2>/dev/null)
+
+if [[ -z "$root" ]]; then
+  exec lazygit "$@"
+fi
+
+repos=("$root")
+
+if [[ -f "$root/.gitmodules" ]]; then
+  while IFS= read -r subpath; do
+    repos+=("$root/$subpath")
+  done < <(git -C "$root" config --file "$root/.gitmodules" --get-regexp 'submodule\..*\.path' | awk '{print $2}')
+fi
+
+repos_expr=""
+for repo in "${repos[@]}"; do
+  repos_expr+="\"$repo\","
+done
+repos_expr="[${repos_expr%,}]"
+
+yq -iy ".recentrepos = $repos_expr" "$state_file"
+
+exec lazygit "$@"
