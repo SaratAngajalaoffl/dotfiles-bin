@@ -20,7 +20,18 @@ if git diff --cached --quiet; then
   exit 1
 fi
 
-prompt="You are a commit message generator. Generate a single git commit message following the Conventional Commits specification. Format: <type>(<optional scope>): <description>. Common types: feat, fix, docs, style, refactor, test, chore, build, ci, perf. Rules: lowercase type, concise description, no period at end, one line only. Respond with the commit message only — no explanation, no markdown, no quotes.
+prompt="You are a git commit message generator following Conventional Commits specification.
+
+Generate a multi-line commit message with:
+1. Subject line: <type>(<optional scope>): <description>
+   - type: feat, fix, docs, style, refactor, test, chore, build, ci, perf
+   - lowercase, concise, no period at end, under 72 characters
+2. A blank line
+3. A body with 2-5 bullet points summarising what changed and why (focus on WHAT and WHY, not HOW)
+   - Each bullet starts with \"- \"
+   - Group related changes together
+
+Rules: no markdown, no quotes, no code fences. Respond with the commit message only.
 
 Staged diff:
 $(git diff --cached)"
