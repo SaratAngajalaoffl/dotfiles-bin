@@ -20,7 +20,7 @@ if git diff --cached --quiet; then
   exit 1
 fi
 
-prompt="You are a git commit message generator following Conventional Commits specification.
+instructions="You are a git commit message generator following Conventional Commits specification.
 
 Generate a multi-line commit message with:
 1. Subject line: <type>(<optional scope>): <description>
@@ -33,13 +33,14 @@ Generate a multi-line commit message with:
 
 Rules: no markdown, no quotes, no code fences. Respond with the commit message only.
 
-Staged diff:
-$(git diff --cached)"
+Staged diff:"
 
 message=""
 if [[ "$agent" == "claude" ]]; then
-  message=$(claude -p "$prompt")
+  message=$( { print -r -- "$instructions"; git diff --cached; } | claude -p )
 else
+  prompt="$instructions
+\"$(git diff --cached)\""
   message=$(pi -p --no-session "$prompt")
 fi
 
