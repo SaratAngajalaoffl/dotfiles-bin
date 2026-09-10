@@ -31,7 +31,7 @@ Generate a multi-line commit message with:
    - Each bullet starts with \"- \"
    - Group related changes together
 
-Rules: no markdown, no quotes, no code fences. Respond with the commit message only.
+Rules: no markdown, no quotes, no code fences, no signature or attribution lines (no \"Co-Authored-By\", no \"Generated with\", no session links). Respond with the commit message only.
 
 Staged diff:"
 
