@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 
 generate_only=false
-agent="claude"
+agent="pi"
 
 if [[ "$1" == "--generate" ]]; then
   generate_only=true
@@ -39,9 +39,7 @@ message=""
 if [[ "$agent" == "claude" ]]; then
   message=$( { print -r -- "$instructions"; git diff --cached; } | claude -p )
 else
-  prompt="$instructions
-\"$(git diff --cached)\""
-  message=$(pi -p --no-session "$prompt")
+  message=$( { print -r -- "$instructions"; git diff --cached; } | pi -p --no-session --model personal-code )
 fi
 
 if [[ -z "$message" ]]; then
