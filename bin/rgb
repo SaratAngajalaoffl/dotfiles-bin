@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Switch OpenRGB profiles and scale their brightness over the SDK.
+
+The OpenRGB server (openrgb.service) owns the hardware and stores profiles;
+the Effects plugin runs inside the GUI client and gets its part of a profile
+pushed to it when the server loads one. So everything here is SDK calls to
+the server: no sudo, no GUI.
+
+Brightness is ours, not OpenRGB's: a profile is applied at N% by scaling
+every effect's `Brightness` (and every hardware mode's `brightness`) and
+uploading the result as `_live`, which is then loaded. At 100% the profile
+is loaded as-is. The chosen profile + brightness (and the last profile that
+wasn't `off`, for toggle) live in ~/.local/state/rgb/state.json.
+
+  rgb status                 JSON: profiles, active profile, brightness
+  rgb set <profile>          load a profile at the current brightness
+  rgb brightness <0-100>     re-apply the current profile at N%
+  rgb toggle                 `off`, or back to the last other profile
+  rgb gui                    show the running OpenRGB GUI's window
+
+Profiles are whatever the server has in /etc/openrgb/profiles (openrgb.service
+runs with --config /etc/openrgb) — save them from the OpenRGB GUI while it's
+connected to the server; names starting with `_` are hidden. Only run one
+GUI: every GUI client runs the profile's effects, and two fight over the LEDs.
+"""
+import json
+import os
+import socket
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOST = "127.0.0.1"
+PORT = 6742
+PROTOCOL_VERSION = 6
+LIVE = "_live"
+OFF = "off"
+
+# How long a stopped effect may keep drawing; see settle().
+EFFECT_WIND_DOWN = 0.3
+
+GUI_CLASS = "org.openrgb.OpenRGB"
+
+STATE_FILE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "rgb/state.json"
+
+PKT_ACK = 10
+PKT_PROTOCOL_VERSION = 40
+PKT_SET_CLIENT_NAME = 50
+PKT_SET_CLIENT_FLAGS = 52
+PKT_SET_SERVER_FLAGS = 53
+PKT_GET_PROFILE_LIST = 150
+PKT_LOAD_PROFILE = 152
+PKT_UPLOAD_PROFILE = 154
+PKT_DOWNLOAD_PROFILE = 155
+PKT_GET_ACTIVE_PROFILE = 156
+
+# Uploading needs the server to treat us as its "local client"; we don't
+# advertise ProfileManager support, so loads aren't echoed back to us.
+FLAG_REQUEST_LOCAL_CLIENT = 1 << 16
+
+HEADER = struct.Struct("<4sIII")
+
+
+class Sdk:
+    def __init__(self):
+        self.sock = socket.create_connection((HOST, PORT), timeout=5)
+        self.send(PKT_PROTOCOL_VERSION, struct.pack("<I", PROTOCOL_VERSION))
+        self.expect(PKT_PROTOCOL_VERSION)
+        self.send(PKT_SET_CLIENT_NAME, b"rgb\0")
+        self.send(PKT_SET_CLIENT_FLAGS, struct.pack("<I", FLAG_REQUEST_LOCAL_CLIENT))
+        self.expect(PKT_SET_SERVER_FLAGS)
+
+    def send(self, pkt_id, data=b""):
+        self.sock.sendall(HEADER.pack(b"ORGB", 0, pkt_id, len(data)) + data)
+
+    def _recv_exact(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("OpenRGB server closed the connection")
+            buf += chunk
+        return buf
+
+    def expect(self, pkt_id):
+        """Read packets until one with `pkt_id` arrives; return its data.
+
+        Anything else the server volunteers (device list updates, other
+        packets' ACKs) is skipped.
+        """
+        while True:
+            magic, _dev, got, size = HEADER.unpack(self._recv_exact(HEADER.size))
+            if magic != b"ORGB":
+                raise ConnectionError("bad packet from OpenRGB server")
+            data = self._recv_exact(size)
+            if got == pkt_id:
+                return data
+
+    def request(self, pkt_id, data=b""):
+        """Send a ProfileManager request and wait for its ACK status."""
+        self.send(pkt_id, data)
+        while True:
+            acked, status = struct.unpack("<II", self.expect(PKT_ACK)[:8])
+            if acked == pkt_id:
+                if status != 0:
+                    raise RuntimeError(f"OpenRGB rejected packet {pkt_id} (status {status})")
+                return
+
+    def profiles(self):
+        self.send(PKT_GET_PROFILE_LIST)
+        data = self.expect(PKT_GET_PROFILE_LIST)
+        (count,) = struct.unpack_from("<H", data, 4)
+        names, off = [], 6
+        for _ in range(count):
+            (n,) = struct.unpack_from("<H", data, off)
+            off += 2
+            names.append(data[off:off + n].rstrip(b"\0").decode())
+            off += n
+        return names
+
+    def active(self):
+        self.send(PKT_GET_ACTIVE_PROFILE)
+        return self.expect(PKT_GET_ACTIVE_PROFILE).rstrip(b"\0").decode()
+
+    def download(self, name):
+        self.send(PKT_DOWNLOAD_PROFILE, name.encode() + b"\0")
+        return json.loads(self.expect(PKT_DOWNLOAD_PROFILE).rstrip(b"\0"))
+
+    def upload(self, profile):
+        self.request(PKT_UPLOAD_PROFILE, json.dumps(profile).encode() + b"\0")
+
+    def load(self, name):
+        self.request(PKT_LOAD_PROFILE, name.encode() + b"\0")
+
+
+def read_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(state):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state))
+
+
+def scaled(profile, pct):
+    """A copy of `profile` with every brightness scaled to `pct`%."""
+    profile = json.loads(json.dumps(profile))
+    f = pct / 100
+    for plugin in profile.get("plugins", {}).values():
+        for effect in plugin.get("Effects", []):
+            if "Brightness" in effect:
+                effect["Brightness"] = round(effect["Brightness"] * f)
+    for controller in profile.get("controllers", []):
+        for mode in controller.get("modes", []):
+            if "brightness" in mode and "brightness_max" in mode:
+                lo = mode.get("brightness_min", 0)
+                mode["brightness"] = round(lo + (mode["brightness"] - lo) * f)
+    return profile
+
+
+def runs_effects(profile):
+    return any(p.get("Effects") for p in profile.get("plugins", {}).values())
+
+
+def settle(sdk, name, profile):
+    """Load a profile that runs no effects a second time.
+
+    The server writes a profile's colours once the GUI acks "about to load",
+    but the Effects plugin acks before its effect thread has stopped, so the
+    old effect's last frame can land on top of them (`off` left everything
+    on its last frame). A second load, with nothing left running, sticks.
+    """
+    if not runs_effects(profile):
+        time.sleep(EFFECT_WIND_DOWN)
+        sdk.load(name)
+
+
+def apply(sdk, name, state):
+    """Load `name` at the remembered brightness (`off` ignores it)."""
+    pct = state.get("brightness", 100)
+    profile = sdk.download(name)
+    if pct >= 100 or name == OFF:
+        sdk.load(name)
+        settle(sdk, name, profile)
+    else:
+        live = scaled(profile, pct)
+        live["profile_name"] = LIVE
+        sdk.upload(live)
+        sdk.load(LIVE)
+        settle(sdk, LIVE, live)
+    state["profile"] = name
+    if name != OFF:
+        state["last_on"] = name
+    write_state(state)
+
+
+def current(sdk, state):
+    """The profile showing now: `_live` stands for the one we scaled."""
+    active = sdk.active()
+    return state.get("profile", "") if active == LIVE else active
+
+
+def busctl(*args):
+    out = subprocess.run(["busctl", "--user", "--json=short", *args],
+                         capture_output=True, text=True)
+    return json.loads(out.stdout) if out.returncode == 0 and out.stdout else None
+
+
+def show_gui():
+    """Bring up the window of the OpenRGB GUI that's already running.
+
+    OpenRGB has no single-instance handoff (a second `openrgb` is a second
+    client, running effects of its own), and its tray icon only opens the
+    window on a double-click, which the StatusNotifierItem Activate call
+    can't express. Its tray menu's Show/Hide entry works, though, and is
+    exported over DBus even with no tray to show it. It toggles, so it's only
+    clicked while the window is hidden; an open window just gets focus.
+    """
+    clients = json.loads(subprocess.run(["hyprctl", "clients", "-j"],
+                                        capture_output=True, text=True).stdout or "[]")
+    if any(c.get("class") == GUI_CLASS for c in clients):
+        subprocess.run(["hyprctl", "dispatch", f'hl.dsp.focus({{ window = "class:{GUI_CLASS}" }})'],
+                       stdout=subprocess.DEVNULL)
+        return
+    names = busctl("list") or []
+    for peer in names:
+        if peer.get("process") != "openrgb" or not peer["name"].startswith(":"):
+            continue
+        layout = busctl("call", peer["name"], "/MenuBar", "com.canonical.dbusmenu",
+                        "GetLayout", "iias", "0", "--", "1", "0")
+        if not layout:
+            continue
+        for item in layout["data"][1][2]:
+            item_id, props, _ = item["data"]
+            if props.get("label", {}).get("data") == "Show/Hide":
+                busctl("call", peer["name"], "/MenuBar", "com.canonical.dbusmenu",
+                       "Event", "isvu", str(item_id), "clicked", "s", "", "0")
+                return
+    # No GUI running at all: start one (it also runs the profiles' effects).
+    subprocess.Popen(["openrgb", "--gui"], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    if cmd == "gui":
+        return show_gui()
+    sdk = Sdk()
+    state = read_state()
+
+    if cmd == "status":
+        print(json.dumps({
+            "profiles": sorted(p for p in sdk.profiles() if not p.startswith("_")),
+            "active": current(sdk, state),
+            "brightness": state.get("brightness", 100),
+            "lastOn": state.get("last_on", ""),
+        }))
+    elif cmd == "set" and len(argv) == 3:
+        apply(sdk, argv[2], state)
+    elif cmd == "brightness" and len(argv) == 3:
+        state["brightness"] = max(0, min(100, int(argv[2])))
+        name = current(sdk, state)
+        if name and name != OFF:
+            apply(sdk, name, state)
+        else:
+            write_state(state)
+    elif cmd == "toggle":
+        if current(sdk, state) != OFF:
+            apply(sdk, OFF, state)
+        elif state.get("last_on"):
+            apply(sdk, state["last_on"], state)
+        else:
+            sys.exit("rgb: no profile to switch back to")
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
