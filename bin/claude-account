@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""Keep several Claude subscriptions signed in, and switch which one Claude
+Code uses.
+
+Claude Code has one login: its OAuth tokens in ~/.claude/.credentials.json
+and the account's details (`oauthAccount`) in ~/.claude.json. This keeps a
+copy of each account's tokens in the keyring and switches by swapping them
+into that file. Only new `claude` sessions pick up a switch; running ones
+keep the account they started with.
+
+  claude-account                  list accounts (* = active)
+  claude-account add [label]      save the account Claude Code is signed in
+                                  with
+  claude-account login            sign in to another account
+                                  (`claude auth login`) and save it
+  claude-account use <account>    switch to an account
+  claude-account rename <account> <label>
+  claude-account remove <account> forget an account (doesn't sign it out)
+  claude-account usage            JSON: every account's limits, for the
+                                  shell's Agents widget
+
+<account> is a label, an email, or an account UUID.
+
+An account is only kept once it's saved (add or login). Signing in to one
+some other way (`/login` in claude) leaves it unsaved until you add it.
+
+Tokens rotate: every refresh returns a new refresh token and the old one
+stops working. So whoever holds the live copy must be the only one to
+refresh it:
+
+- The active account's tokens belong to Claude Code. They're never refreshed
+  here, only copied back into the keyring (sync) if the account is saved,
+  so the stored copy is never stale when you switch away.
+- A stored account's tokens are only used here, so they're refreshed here
+  when they expire, and the new ones written back.
+
+Never switch with `claude auth logout` — it revokes the tokens.
+
+Every command takes a lock first: a refresh and a switch must never
+overlap, or one of them keeps a spent refresh token.
+
+Account list (no secrets): $XDG_STATE_HOME/claude-account/accounts.json.
+Tokens: keyring, `service claude-account account <uuid>`.
+"""
+import datetime as dt
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+CREDENTIALS = CLAUDE_DIR / ".credentials.json"
+# With CLAUDE_CONFIG_DIR set, Claude Code keeps .claude.json inside it.
+GLOBAL_CONFIG = CLAUDE_DIR / ".claude.json" if os.environ.get("CLAUDE_CONFIG_DIR") else HOME / ".claude.json"
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "claude-account"
+INDEX = STATE_DIR / "accounts.json"
+LOCK = STATE_DIR / "lock"
+
+# Claude Code's own OAuth client (from its bundled config).
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+API = "https://api.anthropic.com"
+TIMEOUT = 10
+# Refresh a stored account's token this long before it expires.
+REFRESH_MARGIN = 300
+
+# Per-account caches in ~/.claude.json, dropped on a switch so Claude Code
+# refetches them instead of showing the previous account's plan or usage.
+ACCOUNT_CACHES = (
+    "cachedUsageUtilization",
+    "cachedExtraUsageDisabledReason",
+    "modelAccessCache",
+    "orgModelDefaultCache",
+    "passesEligibilityCache",
+    "additionalModelOptionsCache",
+    "additionalModelCostsCache",
+)
+
+
+class Unauthorized(Exception):
+    pass
+
+
+def die(msg):
+    print(f"claude-account: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ── Files ───────────────────────────────────────────────────────────────────
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+
+
+def write_json(path, data, mode=0o600):
+    """Write via a temp file and rename, so a reader never sees half a file."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def load_index():
+    return read_json(INDEX, {"accounts": []})
+
+
+def save_index(index):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    write_json(INDEX, index, 0o644)
+
+
+def find(index, query):
+    q = query.lower()
+    for a in index["accounts"]:
+        if q in (a["uuid"].lower(), a["label"].lower(), (a.get("email") or "").lower()):
+            return a
+    die(f"no account '{query}' (see `claude-account`)")
+
+
+def lock():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    f = open(LOCK, "w")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
+# ── Keyring ─────────────────────────────────────────────────────────────────
+def keyring_get(uuid):
+    try:
+        out = subprocess.run(["secret-tool", "lookup", "service", "claude-account", "account", uuid],
+                             capture_output=True, text=True, timeout=10).stdout
+        return json.loads(out) if out.strip() else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def keyring_set(uuid, email, oauth):
+    r = subprocess.run(["secret-tool", "store", f"--label=Claude account {email or uuid}",
+                        "service", "claude-account", "account", uuid],
+                       input=json.dumps(oauth), text=True, capture_output=True, timeout=10)
+    if r.returncode != 0:
+        die(f"couldn't save tokens to the keyring: {r.stderr.strip() or 'secret-tool failed'}")
+
+
+def keyring_delete(uuid):
+    subprocess.run(["secret-tool", "clear", "service", "claude-account", "account", uuid],
+                   capture_output=True, timeout=10)
+
+
+# ── HTTP ────────────────────────────────────────────────────────────────────
+def http(url, token=None, body=None):
+    headers = {"User-Agent": "claude-account"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+        headers["anthropic-beta"] = "oauth-2025-04-20"
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers),
+                                    timeout=TIMEOUT) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401):  # 400 = invalid_grant on a refresh
+            raise Unauthorized() from None
+        raise RuntimeError(f"HTTP {e.code}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"unreachable ({e.reason})") from None
+    except TimeoutError:
+        raise RuntimeError("timed out") from None
+
+
+def expired(oauth, margin=0):
+    return (oauth.get("expiresAt") or 0) / 1000 < time.time() + margin
+
+
+def refresh(oauth):
+    """New tokens for a stored account. The old refresh token is spent."""
+    t = http(TOKEN_URL, body={
+        "grant_type": "refresh_token",
+        "refresh_token": oauth["refreshToken"],
+        "client_id": CLIENT_ID,
+        "scope": " ".join(oauth.get("scopes") or []),
+    })
+    new = {**oauth,
+           "accessToken": t["access_token"],
+           "refreshToken": t.get("refresh_token") or oauth["refreshToken"],
+           "expiresAt": int((time.time() + t["expires_in"]) * 1000)}
+    if t.get("refresh_token_expires_in"):
+        new["refreshTokenExpiresAt"] = int((time.time() + t["refresh_token_expires_in"]) * 1000)
+    if t.get("scope"):
+        new["scopes"] = t["scope"].split()
+    return new
+
+
+# ── Sync ────────────────────────────────────────────────────────────────────
+def oauth_account_from_profile(p):
+    """~/.claude.json's `oauthAccount` shape, from /api/oauth/profile."""
+    a, o = p.get("account") or {}, p.get("organization") or {}
+    return {
+        "accountUuid": a.get("uuid"),
+        "emailAddress": a.get("email"),
+        "organizationUuid": o.get("uuid"),
+        "organizationName": o.get("name"),
+        "displayName": a.get("display_name"),
+        "fullName": a.get("full_name"),
+        "billingType": o.get("billing_type"),
+        "hasExtraUsageEnabled": o.get("has_extra_usage_enabled"),
+        "organizationRateLimitTier": o.get("rate_limit_tier"),
+        "seatTier": o.get("seat_tier"),
+        "subscriptionCreatedAt": o.get("subscription_created_at"),
+        "accountCreatedAt": a.get("created_at"),
+    }
+
+
+def identify(oauth, index):
+    """Which account the live credentials belong to: (uuid, oauthAccount).
+
+    A running session can write its own account's tokens back after a
+    switch, so the file isn't trusted to hold the account we last switched
+    to. Tokens we've seen settle it; otherwise ask the API (the token may
+    have been refreshed since); failing that (expired, offline), trust
+    ~/.claude.json.
+    """
+    for a in index["accounts"]:
+        stored = keyring_get(a["uuid"]) or {}
+        if oauth["refreshToken"] == stored.get("refreshToken") or \
+           oauth["accessToken"] == stored.get("accessToken"):
+            return a["uuid"], None
+    if not expired(oauth):
+        try:
+            acct = oauth_account_from_profile(http(API + "/api/oauth/profile", oauth["accessToken"]))
+            if acct["accountUuid"]:
+                return acct["accountUuid"], acct
+        except (Unauthorized, RuntimeError):
+            pass
+    acct = (read_json(GLOBAL_CONFIG, {}) or {}).get("oauthAccount")
+    if acct and acct.get("accountUuid"):
+        return acct["accountUuid"], acct
+    return None, None
+
+
+def sync(index, add=False):
+    """Copy the live credentials into the keyring, if their account is saved
+    (or `add`, which saves it).
+
+    Returns (uuid, entry) for the active account, (None, None) when signed
+    out. An unsaved account's entry isn't in the index."""
+    live = (read_json(CREDENTIALS, {}) or {}).get("claudeAiOauth")
+    if not live or not live.get("refreshToken"):
+        return None, None
+    uuid, acct = identify(live, index)
+    if not uuid:
+        return None, None
+
+    entry = next((a for a in index["accounts"] if a["uuid"] == uuid), None)
+    config_acct = (read_json(GLOBAL_CONFIG, {}) or {}).get("oauthAccount") or {}
+    if config_acct.get("accountUuid") == uuid:
+        acct = config_acct  # Claude Code's own copy is the fullest
+    saved = entry is not None
+    if not saved:
+        email = (acct or {}).get("emailAddress") or ""
+        entry = {"uuid": uuid, "label": email.split("@")[0] or uuid[:8], "email": email}
+    if acct:
+        entry["email"] = acct.get("emailAddress") or entry.get("email", "")
+        entry["oauthAccount"] = acct
+    entry["plan"] = live.get("subscriptionType") or entry.get("plan", "")
+    if not saved:
+        if not add:
+            return uuid, entry
+        index["accounts"].append(entry)
+
+    stored = keyring_get(uuid)
+    if stored != live:
+        keyring_set(uuid, entry["email"], live)
+    index["active"] = uuid
+    save_index(index)
+    return uuid, entry
+
+
+def saved(index, uuid):
+    return any(a["uuid"] == uuid for a in index["accounts"])
+
+
+# ── Commands ────────────────────────────────────────────────────────────────
+def cmd_list(_args):
+    with lock():
+        index = load_index()
+        active, current = sync(index)
+    accounts = index["accounts"] + ([] if not active or saved(index, active) else [current])
+    if not accounts:
+        print("Not signed in. Sign in with `claude-account login`.")
+        return
+    width = max(len(a["label"]) for a in accounts)
+    for a in accounts:
+        mark = "*" if a["uuid"] == active else " "
+        plan = f"  ({a['plan']})" if a.get("plan") else ""
+        note = "" if saved(index, a["uuid"]) else "  — not saved, run `claude-account add`"
+        print(f"{mark} {a['label']:<{width}}  {a.get('email', '')}{plan}{note}")
+
+
+def cmd_add(args):
+    if len(args) > 1:
+        die("usage: claude-account add [label]")
+    with lock():
+        index = load_index()
+        uuid, entry = sync(index)
+        if not uuid:
+            die("not signed in to Claude Code; sign in with `claude-account login`")
+        was_saved = saved(index, uuid)
+        if not was_saved:
+            uuid, entry = sync(index, add=True)
+        if args:
+            entry["label"] = args[0]
+            save_index(index)
+    print(f"{'Already saved' if was_saved and not args else 'Saved'} "
+          f"{entry.get('email') or uuid} as '{entry['label']}'.")
+
+
+def cmd_login(_args):
+    with lock():
+        index = load_index()
+        before, current = sync(index)
+    if before and not saved(index, before):
+        print(f"Note: {current.get('email') or before} isn't saved; run `claude-account add` "
+              "first if you want to switch back to it.")
+        if input("Sign in to another account anyway? [y/N] ").strip().lower() != "y":
+            return
+    r = subprocess.run(["claude", "auth", "login"])
+    if r.returncode != 0:
+        sys.exit(r.returncode)
+    with lock():
+        index = load_index()
+        after, a = sync(index, add=True)
+    if not after:
+        die("still signed out")
+    print(f"\nSigned in as {a.get('email') or a['label']}, saved as '{a['label']}'.")
+    print(f"Rename it with: claude-account rename {a['label']} <label>")
+
+
+def cmd_use(args):
+    if len(args) != 1:
+        die("usage: claude-account use <account>")
+    with lock():
+        index = load_index()
+        current, entry = sync(index)
+        if current and not saved(index, current):
+            print(f"Note: {entry.get('email') or current} wasn't saved, so switching back to it "
+                  "means signing in again.", file=sys.stderr)
+        target = find(index, args[0])
+        if target["uuid"] == current:
+            print(f"Already using {target['label']}.")
+            return
+        oauth = keyring_get(target["uuid"])
+        if not oauth:
+            die(f"no tokens saved for {target['label']}; sign in again with `claude-account login`")
+        # Hand Claude Code a fresh token; it takes over refreshing from here.
+        if expired(oauth, REFRESH_MARGIN):
+            try:
+                oauth = refresh(oauth)
+            except Unauthorized:
+                die(f"{target['label']}'s sign-in has expired; switch with `claude-account login`")
+            except RuntimeError as e:
+                die(f"couldn't refresh {target['label']}'s token: {e}")
+            keyring_set(target["uuid"], target.get("email"), oauth)
+
+        creds = read_json(CREDENTIALS, {}) or {}
+        creds["claudeAiOauth"] = oauth
+        write_json(CREDENTIALS, creds)
+
+        config = read_json(GLOBAL_CONFIG, {}) or {}
+        if target.get("oauthAccount"):
+            config["oauthAccount"] = target["oauthAccount"]
+        for key in ACCOUNT_CACHES:
+            config.pop(key, None)
+        write_json(GLOBAL_CONFIG, config)
+
+        index["active"] = target["uuid"]
+        save_index(index)
+    print(f"Switched to {target['label']} ({target.get('email', '')}). New claude sessions use it.")
+
+
+def cmd_rename(args):
+    if len(args) != 2:
+        die("usage: claude-account rename <account> <label>")
+    with lock():
+        index = load_index()
+        find(index, args[0])["label"] = args[1]
+        save_index(index)
+
+
+def cmd_remove(args):
+    if len(args) != 1:
+        die("usage: claude-account remove <account>")
+    with lock():
+        index = load_index()
+        active, _ = sync(index)
+        a = find(index, args[0])
+        if a["uuid"] == active:
+            die(f"{a['label']} is the active account; switch to another first")
+        keyring_delete(a["uuid"])
+        index["accounts"].remove(a)
+        save_index(index)
+    print(f"Removed {a['label']}.")
+
+
+# ── Usage ───────────────────────────────────────────────────────────────────
+MODEL_WINDOWS = {  # weekly per-model limits, shown when the plan has them
+    "seven_day_opus": "Opus",
+    "seven_day_sonnet": "Sonnet",
+}
+
+
+def window(w):
+    if not w or w.get("utilization") is None:
+        return None
+    return {"percent": w["utilization"], "resets_at": w.get("resets_at")}
+
+
+def limits(token):
+    """The numbers Claude Code's /usage shows, for one token."""
+    u = http(API + "/api/oauth/usage", token)
+    severity = {l.get("kind"): l.get("severity") for l in u.get("limits") or []}
+    session, weekly = window(u.get("five_hour")), window(u.get("seven_day"))
+    if session: session["severity"] = severity.get("session", "normal")
+    if weekly: weekly["severity"] = severity.get("weekly_all", "normal")
+
+    extra = u.get("extra_usage") or {}
+    places = extra.get("decimal_places") or 2
+    return {
+        "session": session,
+        "weekly": weekly,
+        "models": [{"name": name, **w} for key, name in MODEL_WINDOWS.items()
+                   if (w := window(u.get(key)))],
+        "extra": {
+            "enabled": bool(extra.get("is_enabled")),
+            "used": (extra.get("used_credits") or 0) / 10 ** places,
+            "limit": (extra["monthly_limit"] / 10 ** places) if extra.get("monthly_limit") else None,
+            "currency": extra.get("currency") or "USD",
+        },
+    }
+
+
+def account_usage(a, active, is_saved=True):
+    out = {"uuid": a["uuid"], "label": a["label"], "email": a.get("email", ""),
+           "plan": a.get("plan", ""), "active": a["uuid"] == active, "saved": is_saved}
+    if out["active"]:
+        # Claude Code's token: read-only, never refreshed here.
+        oauth = (read_json(CREDENTIALS, {}) or {}).get("claudeAiOauth") or {}
+        if expired(oauth):
+            return {**out, "ok": False, "error": "Sign-in expired, run claude to renew it"}
+    else:
+        oauth = keyring_get(a["uuid"])
+        if not oauth:
+            return {**out, "ok": False, "error": "No saved tokens, sign in with claude-account login"}
+        if expired(oauth, REFRESH_MARGIN):
+            try:
+                oauth = refresh(oauth)
+            except Unauthorized:
+                return {**out, "ok": False, "error": "Sign-in expired, sign in with claude-account login"}
+            except RuntimeError as e:
+                return {**out, "ok": False, "error": f"Token refresh {e}"}
+            keyring_set(a["uuid"], a.get("email"), oauth)
+    out["plan"] = oauth.get("subscriptionType") or out["plan"]
+    try:
+        return {**out, "ok": True, **limits(oauth["accessToken"])}
+    except Unauthorized:
+        return {**out, "ok": False, "error": "Sign-in rejected" + (", run claude to renew it" if out["active"] else "")}
+    except RuntimeError as e:
+        return {**out, "ok": False, "error": f"Usage API {e}"}
+
+
+def cmd_usage(_args):
+    # Held throughout: a stored account's refresh must not overlap a switch.
+    with lock():
+        index = load_index()
+        active, current = sync(index)
+        accounts = [account_usage(a, active) for a in index["accounts"]]
+        # Signed in to an account that isn't saved: shown, with `saved`
+        # false, so the widget can offer to add it.
+        if active and not saved(index, active):
+            accounts.append(account_usage(current, active, is_saved=False))
+    if not accounts:
+        out = {"ok": False, "error": "Not signed in to Claude Code", "accounts": []}
+    else:
+        out = {"ok": True, "active": active, "accounts": accounts}
+    out["fetched_at"] = dt.datetime.now().astimezone().isoformat()
+    json.dump(out, sys.stdout)
+
+
+COMMANDS = {"list": cmd_list, "add": cmd_add, "login": cmd_login, "use": cmd_use,
+            "rename": cmd_rename, "remove": cmd_remove, "usage": cmd_usage}
+
+if __name__ == "__main__":
+    args = sys.argv[1:] or ["list"]
+    if args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+    elif args[0] in COMMANDS:
+        COMMANDS[args[0]](args[1:])
+    else:
+        die(f"unknown command '{args[0]}' (see claude-account --help)")
