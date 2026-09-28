@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""aicp — AI-commit every dirty submodule, then the parent repo, in one pass.
+
+Replaces the manual loop of running `aic` in each dirty submodule and then
+again in the parent. Submodule messages are generated in parallel, reviewed
+all at once, and committed + pushed; the parent repo — which now holds the
+submodule bumps — then goes through the same generate/review/commit/push flow.
+"""
+
+import argparse
+import concurrent.futures
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+SENTINEL = "---8<---"
+MAX_WORKERS = 8
+
+HEADER = """\
+# aicp — review the generated commit messages.
+#
+# Every block below starts with a '---8<--- <repo>' line; everything after it,
+# up to the next such line, is that repo's commit message. Edit freely.
+#   - delete a whole block  → that repo is skipped
+#   - empty a block's body  → that repo is skipped
+# Save and quit to commit everything still listed here.
+"""
+
+
+def git(repo, *args):
+    return subprocess.run(
+        ["git", "-C", repo, *args],
+        text=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def die(msg):
+    print(f"aicp: {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def repo_root():
+    r = git(os.getcwd(), "rev-parse", "--show-toplevel")
+    if r.returncode != 0:
+        die("not inside a git repository")
+    return r.stdout.strip()
+
+
+def submodule_paths(root):
+    r = git(root, "config", "--file", os.path.join(root, ".gitmodules"),
+            "--get-regexp", r"submodule\..*\.path")
+    if r.returncode != 0:
+        return []
+    return [os.path.join(root, line.split(None, 1)[1]) for line in r.stdout.splitlines() if line.split(None, 1)[1:]]
+
+
+def is_dirty(repo):
+    return bool(git(repo, "status", "--porcelain").stdout.strip())
+
+
+def is_detached(repo):
+    return git(repo, "symbolic-ref", "-q", "HEAD").returncode != 0
+
+
+def stage(repo):
+    """Stage everything in repo; return a short diffstat, or None if nothing."""
+    git(repo, "add", "-A")
+    if git(repo, "diff", "--cached", "--quiet").returncode == 0:
+        return None
+    return git(repo, "diff", "--cached", "--shortstat").stdout.strip()
+
+
+def generate_message(repo, agent):
+    cmd = ["aic", "--generate"]
+    if agent:
+        cmd += ["--agent", agent]
+    r = subprocess.run(cmd, cwd=repo, text=True, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode != 0 or not r.stdout.strip():
+        raise RuntimeError((r.stderr.strip() or r.stdout.strip() or "aic produced no message"))
+    return r.stdout.strip()
+
+
+def checklist(title, text, items):
+    """items: [(tag, label, on)]. Returns selected tags, or None if cancelled.
+
+    whiptail draws its UI on stdout and therefore needs stdout to stay a TTY, so
+    the selection is redirected to a pipe with --output-fd and read from there.
+    """
+    args = ["whiptail", "--title", title, "--checklist", text, "0", "0", "0"]
+    for tag, label, on in items:
+        args += [tag, label, "ON" if on else "OFF"]
+    read_fd, write_fd = os.pipe()
+    try:
+        args += ["--output-fd", str(write_fd)]
+        proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, pass_fds=(write_fd,))
+        os.close(write_fd)
+        with os.fdopen(read_fd, "r") as fh:
+            selection = fh.read()
+        if proc.wait() != 0:
+            return None
+    finally:
+        try:
+            os.close(write_fd)
+        except OSError:
+            pass
+    return re.findall(r'"([^"]*)"', selection)
+
+
+def review(entries):
+    """entries: [{name, message, stat}]. Returns {name: message} for kept blocks."""
+    body = "\n".join(
+        f"{SENTINEL} {e['name']}  ({e['stat']})\n{e['message']}\n" for e in entries
+    )
+    fd, path = tempfile.mkstemp(prefix="aicp.", suffix=".md")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(HEADER + "\n" + body)
+
+    editor = shlex.split(os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vim")
+    subprocess.run(editor + [path])
+
+    with open(path) as fh:
+        text = fh.read()
+    os.unlink(path)
+
+    kept, name, lines = {}, None, []
+    for line in text.splitlines():
+        if line.startswith(SENTINEL):
+            if name and "\n".join(lines).strip():
+                kept[name] = "\n".join(lines).strip()
+            name = line[len(SENTINEL):].split("(")[0].strip()
+            lines = []
+        elif name is not None:
+            lines.append(line)
+    if name and "\n".join(lines).strip():
+        kept[name] = "\n".join(lines).strip()
+    return kept
+
+
+def commit_and_push(repo, name, message, push=True):
+    r = git(repo, "commit", "-m", message)
+    if r.returncode != 0:
+        print(f"  {name}: commit failed\n{r.stderr.strip()}")
+        return False
+    short = git(repo, "rev-parse", "--short", "HEAD").stdout.strip()
+    if not push:
+        print(f"  {name}: committed {short}")
+        return True
+    upstream = git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    if upstream.returncode != 0:
+        print(f"  {name}: committed {short} (no upstream, not pushed)")
+        return True
+    p = git(repo, "push")
+    if p.returncode != 0:
+        print(f"  {name}: committed {short}, push failed\n{p.stderr.strip()}")
+        return False
+    print(f"  {name}: committed {short}, pushed → {upstream.stdout.strip()}")
+    return True
+
+
+def run_pass(label, repos, agent, push=True):
+    """repos: [(name, path)]. Generate → review → commit/push. Returns committed names."""
+    entries = []
+    for name, path in repos:
+        stat = stage(path)
+        if stat is None:
+            print(f"  {label}/{name}: nothing staged, skipping")
+            continue
+        entries.append({"name": name, "path": path, "stat": stat, "detached": is_detached(path)})
+    if not entries:
+        return []
+
+    print(f"  generating {len(entries)} message(s) in parallel...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(entries))) as pool:
+        futures = {pool.submit(generate_message, e["path"], agent): e for e in entries}
+        for future in concurrent.futures.as_completed(futures):
+            entry = futures[future]
+            try:
+                entry["message"] = future.result()
+            except Exception as exc:
+                entry["message"] = None
+                print(f"  {label}/{entry['name']}: {exc}")
+            else:
+                print(f"\n  {label}/{entry['name']}  ({entry['stat']})\n"
+                      + "\n".join(f"    {line}" for line in entry["message"].splitlines())
+                      + "\n")
+
+    entries = [e for e in entries if e.get("message")]
+    if not entries:
+        print(f"  {label}: no messages generated")
+        return []
+
+    def summary(entry):
+        head = entry["message"].splitlines()[0]
+        if entry["detached"]:
+            return f"{head}  [detached HEAD — skipped unless selected]"
+        return head
+
+    selected = checklist(
+        f"aicp — {label}",
+        "Select which repos to commit and push.",
+        [(e["name"], summary(e), not e["detached"]) for e in entries],
+    )
+    if selected is None:
+        print(f"  {label}: cancelled, nothing committed")
+        return []
+
+    entries = [e for e in entries if e["name"] in selected]
+    if not entries:
+        print(f"  {label}: nothing selected")
+        return []
+
+    print("  opening editor for the selected messages...")
+    messages = review(entries)
+
+    committed = []
+    for entry in entries:
+        message = messages.get(entry["name"])
+        if not message:
+            print(f"  {entry['name']}: dropped in the editor, skipping")
+            continue
+        if entry["detached"]:
+            print(f"  {entry['name']}: warning: committing on a detached HEAD")
+        if commit_and_push(entry["path"], entry["name"], message, push):
+            committed.append(entry["name"])
+    return committed
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="aicp",
+        description="Generate, review, commit and push AI commit messages for every "
+                    "dirty submodule, then for the parent repo.",
+    )
+    parser.add_argument("--agent", help="backend passed through to aic (claude or pi)")
+    parser.add_argument("--no-push", action="store_true",
+                        help="commit without pushing (pushes by default)")
+    args = parser.parse_args()
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die("needs an interactive terminal (lazygit: use a custom command with 'output: terminal')")
+    if not shutil.which("aic"):
+        die("aic not found on PATH")
+    if not shutil.which("whiptail"):
+        die("whiptail not found (pacman -S libnewt)")
+
+    root = repo_root()
+    subs = submodule_paths(root)
+    dirty_subs = [(os.path.relpath(p, root), p) for p in subs if is_dirty(p)]
+
+    if dirty_subs:
+        print(f"aicp: {len(dirty_subs)} dirty submodule(s): {', '.join(n for n, _ in dirty_subs)}")
+        run_pass("sub", dirty_subs, args.agent, not args.no_push)
+    else:
+        print("aicp: no dirty submodules")
+
+    if is_dirty(root):
+        print(f"\naicp: parent repo {root}")
+        run_pass("parent", [("parent", root)], args.agent, not args.no_push)
+    else:
+        print("aicp: parent repo has nothing to commit")
+
+    print("\naicp: done")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
