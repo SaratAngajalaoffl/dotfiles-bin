@@ -166,7 +166,7 @@ cmd_merge() {
   local cur
   cur=$(git -C "$WT_MAIN" branch --show-current)
   [[ $cur == "$WT_BASE" ]] || die "main checkout is on '$cur', expected base '$WT_BASE'"
-  [[ -z $(git -C "$WT_MAIN" status --porcelain --untracked-files=no) ]] \
+  [[ -z $(git -C "$WT_MAIN" status --porcelain --untracked-files=no --ignore-submodules=all) ]] \
     || die "main checkout $WT_MAIN has uncommitted changes"
 
   if [[ $(git -C "$WT_PATH" rev-list --count "$WT_BASE..HEAD") -eq 0 ]]; then
