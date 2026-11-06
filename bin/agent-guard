@@ -37,7 +37,7 @@ HINT_CLAUDE = (
 )
 HINT_GENERIC = (
     "Ask the user to start this task as a worktree session (nvim agent popup: "
-    "Ctrl+Shift+N), or run `agent-worktree new <name>` and work in the path it prints."
+    "Ctrl+N, or <leader>an in normal mode), or run `agent-worktree new <name>` and work in the path it prints."
 )
 
 GIT_MUTATING = {
