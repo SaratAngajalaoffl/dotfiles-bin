@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# agent-worktree — git worktrees for AI agent sessions.
+#
+# Every agent session works in its own worktree under
+#   ~/.worktrees/<repo-slug>/<name>   on branch   agent/<name>
+# so edits never touch the main checkout (where ~/.config/* symlinks point).
+# agent-guard enforces this; this script creates, lists, merges and removes them.
+#
+#   agent-worktree new <name> [--from <dir>] [--submodules]   prints the worktree path
+#   agent-worktree list [--from <dir>]                        path<TAB>branch<TAB>base<TAB>state
+#   agent-worktree merge <path>                               rebase onto base, ff-merge, remove
+#   agent-worktree rm <path> [--force]                        remove worktree (+ branch if merged)
+#
+# The repo is whichever git repo contains --from (default: cwd). Inside a
+# submodule that is the submodule's own repo, so an agent editing nvim/ gets a
+# worktree of dotfiles-nvim, not of the parent.
+
+set -euo pipefail
+
+ROOT="${AGENT_WORKTREE_ROOT:-$HOME/.worktrees}"
+
+die() { echo "agent-worktree: $*" >&2; exit 1; }
+log() { echo "agent-worktree: $*" >&2; }
+
+# Main worktree toplevel of the repo containing $1.
+main_toplevel() {
+  local dir=$1 gitdir common wt
+  gitdir=$(git -C "$dir" rev-parse --path-format=absolute --git-dir 2>/dev/null) \
+    || die "not a git repository: $dir"
+  common=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir)
+  if [[ $gitdir == "$common" ]]; then
+    git -C "$dir" rev-parse --show-toplevel
+    return
+  fi
+  # Linked worktree. A submodule's git dir lives in the parent's
+  # .git/modules/<name> and names its checkout via core.worktree; a plain
+  # repo's main checkout is the parent of its .git.
+  wt=$(git --git-dir="$common" config core.worktree || true)
+  if [[ -n $wt ]]; then
+    (cd "$common" && cd "$wt" && pwd -P)
+  else
+    dirname "$common"
+  fi
+}
+
+# ~/dotfiles/nvim -> dotfiles-nvim ; /srv/x -> srv-x
+slug_for() {
+  local p=$1
+  p=${p#"$HOME"/}
+  p=${p#/}
+  echo "${p//\//-}"
+}
+
+sanitize() { echo "$1" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//'; }
+
+cmd_new() {
+  local name="" from=$PWD submodules=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --from) from=$2; shift 2 ;;
+      --submodules) submodules=1; shift ;;
+      -*) die "unknown flag: $1" ;;
+      *) name=$1; shift ;;
+    esac
+  done
+  [[ -n $name ]] || die "usage: agent-worktree new <name> [--from <dir>] [--submodules]"
+  name=$(sanitize "$name")
+  [[ -n $name ]] || die "name has no usable characters"
+
+  local main base path branch
+  main=$(main_toplevel "$from")
+  base=$(git -C "$main" branch --show-current)
+  [[ -n $base ]] || die "main checkout $main is on a detached HEAD; check out a branch first"
+  path="$ROOT/$(slug_for "$main")/$name"
+  branch="agent/$name"
+
+  [[ ! -e $path ]] || die "already exists: $path"
+  git -C "$main" show-ref --verify --quiet "refs/heads/$branch" \
+    && die "branch $branch already exists (remove it or pick another name)"
+
+  mkdir -p "$(dirname "$path")"
+  git -C "$main" worktree add -q -b "$branch" "$path" "$base" >&2
+  git -C "$main" config "branch.$branch.agentBase" "$base"
+
+  if [[ $submodules -eq 1 && -f $path/.gitmodules ]]; then
+    log "initialising submodules (this clones each one)…"
+    git -C "$path" submodule update --init --recursive >&2
+  fi
+
+  log "created $path on $branch (base: $base)"
+  echo "$path"
+}
+
+# Resolve a worktree path to: main toplevel, branch, base.
+wt_info() {
+  local path=$1
+  [[ -d $path ]] || die "no such worktree: $path"
+  path=$(cd "$path" && pwd -P)
+  local gd cd
+  gd=$(git -C "$path" rev-parse --path-format=absolute --git-dir)
+  cd=$(git -C "$path" rev-parse --path-format=absolute --git-common-dir)
+  [[ $gd != "$cd" ]] || die "$path is a main checkout, not a linked worktree"
+  WT_PATH=$path
+  WT_MAIN=$(main_toplevel "$path")
+  WT_BRANCH=$(git -C "$path" branch --show-current)
+  [[ -n $WT_BRANCH ]] || die "$path is on a detached HEAD"
+  WT_BASE=$(git -C "$WT_MAIN" config "branch.$WT_BRANCH.agentBase" || git -C "$WT_MAIN" branch --show-current)
+}
+
+cmd_list() {
+  local from=$PWD
+  [[ ${1:-} == --from ]] && from=$2
+  local main
+  main=$(main_toplevel "$from")
+  # First entry is always the main worktree (for a submodule, its git dir).
+  git -C "$main" worktree list --porcelain | awk '/^worktree /{sub(/^worktree /,""); if (n++) print}' | while read -r p; do
+    [[ -d $p ]] || continue
+    local b base state ahead
+    b=$(git -C "$p" branch --show-current)
+    base=$(git -C "$main" config "branch.$b.agentBase" 2>/dev/null || echo "?")
+    ahead=$(git -C "$p" rev-list --count "$base..HEAD" 2>/dev/null || echo "?")
+    state="+$ahead"
+    [[ -n $(git -C "$p" status --porcelain) ]] && state="$state dirty"
+    printf '%s\t%s\t%s\t%s\n' "$p" "$b" "$base" "$state"
+  done
+}
+
+kill_tmux_for() {
+  command -v tmux >/dev/null || return 0
+  tmux list-sessions -F '#{session_name}	#{@agent_path}' 2>/dev/null \
+    | awk -F'\t' -v p="$1" '$2==p{print $1}' \
+    | while read -r s; do tmux kill-session -t "=$s" 2>/dev/null || true; done
+}
+
+cmd_rm() {
+  local path="" force=0
+  for a in "$@"; do
+    case $a in --force) force=1 ;; *) path=$a ;; esac
+  done
+  [[ -n $path ]] || die "usage: agent-worktree rm <path> [--force]"
+  wt_info "$path"
+  kill_tmux_for "$WT_PATH"
+  trap 'rmdir "$(dirname "$WT_PATH")" 2>/dev/null || true' RETURN
+  if [[ $force -eq 1 ]]; then
+    git -C "$WT_MAIN" worktree remove --force "$WT_PATH"
+    git -C "$WT_MAIN" branch -D "$WT_BRANCH" >/dev/null
+    git -C "$WT_MAIN" config --unset "branch.$WT_BRANCH.agentBase" 2>/dev/null || true
+    log "deleted $WT_PATH and $WT_BRANCH"
+  else
+    git -C "$WT_MAIN" worktree remove "$WT_PATH" \
+      || die "worktree has uncommitted changes; commit them or use --force to discard"
+    if git -C "$WT_MAIN" branch -d "$WT_BRANCH" >/dev/null 2>&1; then
+      git -C "$WT_MAIN" config --unset "branch.$WT_BRANCH.agentBase" 2>/dev/null || true
+      log "removed $WT_PATH and merged branch $WT_BRANCH"
+    else
+      log "removed $WT_PATH; kept unmerged branch $WT_BRANCH"
+    fi
+  fi
+}
+
+cmd_merge() {
+  [[ $# -eq 1 ]] || die "usage: agent-worktree merge <path>"
+  wt_info "$1"
+  [[ -z $(git -C "$WT_PATH" status --porcelain) ]] \
+    || die "worktree has uncommitted changes; ask the agent to commit first"
+  local cur
+  cur=$(git -C "$WT_MAIN" branch --show-current)
+  [[ $cur == "$WT_BASE" ]] || die "main checkout is on '$cur', expected base '$WT_BASE'"
+  [[ -z $(git -C "$WT_MAIN" status --porcelain --untracked-files=no) ]] \
+    || die "main checkout $WT_MAIN has uncommitted changes"
+
+  if [[ $(git -C "$WT_PATH" rev-list --count "$WT_BASE..HEAD") -eq 0 ]]; then
+    log "nothing to merge: $WT_BRANCH has no commits beyond $WT_BASE"
+  else
+    if ! git -C "$WT_PATH" merge-base --is-ancestor "$WT_BASE" HEAD; then
+      log "rebasing $WT_BRANCH onto $WT_BASE…"
+      git -C "$WT_PATH" rebase -q "$WT_BASE" >&2 || {
+        git -C "$WT_PATH" rebase --abort 2>/dev/null || true
+        die "rebase onto $WT_BASE conflicts; resolve it in $WT_PATH (or have the agent do it), then merge again"
+      }
+    fi
+    git -C "$WT_MAIN" merge -q --ff-only "$WT_BRANCH" >&2
+    log "merged $WT_BRANCH into $WT_BASE"
+  fi
+  cmd_rm "$WT_PATH"
+
+  # A submodule merge still needs the parent to record the new SHA.
+  local super
+  super=$(git -C "$WT_MAIN" rev-parse --show-superproject-working-tree 2>/dev/null || true)
+  if [[ -n $super ]]; then
+    log "submodule updated — bump it in the parent: git -C $super add ${WT_MAIN#"$super"/} && git -C $super commit"
+  fi
+}
+
+case ${1:-} in
+  new)   shift; cmd_new "$@" ;;
+  list)  shift; cmd_list "$@" ;;
+  merge) shift; cmd_merge "$@" ;;
+  rm)    shift; cmd_rm "$@" ;;
+  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

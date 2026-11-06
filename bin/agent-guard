@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""agent-guard — keep AI agent edits inside git worktrees.
+
+One rule shared by Claude Code (PreToolUse hook) and pi (worktree-guard
+extension):
+
+  * a file outside any git repo                  -> allowed (scratch, ~/.claude, /tmp)
+  * a file in a linked worktree                  -> allowed
+      - but if $AGENT_WORKTREE is set (sessions started by the nvim agent
+        popup), only inside that worktree
+  * a file in a repo's main checkout             -> denied
+
+Bash can't be fully policed by a hook; this blocks git commands that change
+history or the checkout (commit, merge, reset, ...) when they would run in a
+main checkout. The OS sandboxes (pi's bubblewrap, Claude's sandbox) are what
+pin shell writes to the cwd.
+
+Agents' own state dirs (~/.claude, ~/.pi) are always writable, even though
+they are git repos; add more with AGENT_GUARD_EXEMPT (colon-separated).
+Set AGENT_ALLOW_MAIN=1 to turn the guard off for one session.
+
+  agent-guard check-path <file> [cwd]     exit 0 = allowed, 2 = denied (reason on stderr)
+  agent-guard check-bash <command> [cwd]
+  agent-guard claude-hook                 reads Claude PreToolUse JSON on stdin
+"""
+
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+HINT_CLAUDE = (
+    "Use the EnterWorktree tool to move this session into a worktree, then "
+    "make the change there."
+)
+HINT_GENERIC = (
+    "Ask the user to start this task as a worktree session (nvim agent popup: "
+    "Ctrl+Shift+N), or run `agent-worktree new <name>` and work in the path it prints."
+)
+
+GIT_MUTATING = {
+    "commit", "merge", "rebase", "reset", "checkout", "switch", "restore",
+    "stash", "cherry-pick", "revert", "am", "apply", "pull", "mv", "rm", "clean",
+}
+
+
+def git(dirpath, *args):
+    r = subprocess.run(["git", "-C", dirpath, *args], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def existing_dir(path):
+    """Nearest existing directory at or above path (files may not exist yet)."""
+    p = path
+    while not os.path.isdir(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            return p
+        p = parent
+    return p
+
+
+def classify(path):
+    """Return (kind, toplevel): kind in {'none', 'worktree', 'main'}."""
+    d = existing_dir(path)
+    out = git(d, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--show-toplevel")
+    if not out:
+        return "none", None
+    lines = out.splitlines()
+    if len(lines) < 3:  # inside .git itself, or a bare repo
+        return "main", lines[0] if lines else d
+    git_dir, common, top = lines[0], lines[1], lines[2]
+    return ("worktree" if git_dir != common else "main"), top
+
+
+def exempt_roots():
+    roots = ["~/.claude", "~/.pi"]
+    roots += [r for r in os.environ.get("AGENT_GUARD_EXEMPT", "").split(":") if r]
+    return [os.path.realpath(os.path.expanduser(r)) for r in roots]
+
+
+def within(path, root):
+    root = os.path.realpath(root)
+    return path == root or path.startswith(root + os.sep)
+
+
+def check_path(target, cwd, hint):
+    if os.environ.get("AGENT_ALLOW_MAIN") == "1":
+        return None
+    path = os.path.realpath(os.path.join(cwd, os.path.expanduser(target)))
+    if any(within(path, r) for r in exempt_roots()):
+        return None
+    if ".git" in path.split(os.sep):
+        return f"{path} is inside a .git directory; agents don't edit git internals."
+    kind, top = classify(path)
+    if kind == "none":
+        return None
+    session_wt = os.environ.get("AGENT_WORKTREE")
+    if kind == "worktree":
+        if session_wt and not within(path, session_wt):
+            return (
+                f"{path} is outside this session's worktree ({session_wt}). "
+                "Only edit files inside your own worktree."
+            )
+        return None
+    if session_wt and within(path, session_wt):  # defensive: shouldn't happen
+        return None
+    return (
+        f"Edits to the main checkout ({top}) are blocked: agents work only in git "
+        f"worktrees. {hint}"
+    )
+
+
+def git_targets(command, cwd):
+    """Yield (dir, subcommand) for each git invocation in a shell command."""
+    cur = cwd
+    for seg in re.split(r"&&|\|\||;|\||\n", command):
+        try:
+            toks = shlex.split(seg)
+        except ValueError:
+            toks = seg.split()
+        while toks and re.match(r"^\w+=", toks[0]):  # FOO=bar git ...
+            toks.pop(0)
+        if not toks:
+            continue
+        if toks[0] in ("cd", "pushd") and len(toks) > 1:
+            cur = os.path.join(cur, os.path.expanduser(toks[1]))
+            continue
+        if os.path.basename(toks[0]) != "git":
+            continue
+        d, i = cur, 1
+        while i < len(toks) and toks[i].startswith("-"):
+            if toks[i] == "-C" and i + 1 < len(toks):
+                d = os.path.join(d, os.path.expanduser(toks[i + 1]))
+                i += 2
+            elif toks[i] in ("-c", "--git-dir", "--work-tree") and i + 1 < len(toks):
+                i += 2
+            else:
+                i += 1
+        if i < len(toks):
+            yield d, toks[i]
+
+
+def check_bash(command, cwd, hint):
+    if os.environ.get("AGENT_ALLOW_MAIN") == "1":
+        return None
+    for d, sub in git_targets(command, cwd):
+        if sub not in GIT_MUTATING:
+            continue
+        kind, top = classify(os.path.realpath(d))
+        if kind == "main":
+            return (
+                f"`git {sub}` in the main checkout ({top}) is blocked: agents work only "
+                f"in git worktrees. {hint}"
+            )
+    return None
+
+
+def claude_hook():
+    data = json.load(sys.stdin)
+    tool = data.get("tool_name", "")
+    inp = data.get("tool_input", {}) or {}
+    cwd = data.get("cwd") or os.getcwd()
+    reason = None
+    if tool in ("Edit", "Write", "MultiEdit"):
+        reason = check_path(inp.get("file_path", ""), cwd, HINT_CLAUDE)
+    elif tool == "NotebookEdit":
+        reason = check_path(inp.get("notebook_path", ""), cwd, HINT_CLAUDE)
+    elif tool == "Bash":
+        reason = check_bash(inp.get("command", ""), cwd, HINT_CLAUDE)
+    return reason
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__, file=sys.stderr)
+        return 1
+    mode = args[0]
+    if mode == "claude-hook":
+        reason = claude_hook()
+    elif mode in ("check-path", "check-bash") and len(args) >= 2:
+        cwd = args[2] if len(args) > 2 else os.getcwd()
+        fn = check_path if mode == "check-path" else check_bash
+        reason = fn(args[1], cwd, HINT_GENERIC)
+    else:
+        print(__doc__, file=sys.stderr)
+        return 1
+    if reason:
+        print(reason, file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
